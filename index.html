@@ -237,14 +237,16 @@
   $('listI').addEventListener('click', function (e) { var a = e.target.closest('a.rm'); if (!a) return; e.preventDefault(); invoices.splice(+a.dataset.i, 1); render(); });
 
   async function addRoster(files) {
-    if (!files.length) return;
-    try { var wb = await readWorkbook(files[0]); roster = { file: files[0], rows: parseRoster(wb) }; $('msg').textContent = ''; }
+    var list = Array.prototype.slice.call(files); // input.value='' で FileList が空になる前に確保する
+    if (!list.length) return;
+    try { var wb = await readWorkbook(list[0]); roster = { file: list[0], rows: parseRoster(wb) }; $('msg').textContent = ''; }
     catch (e) { $('msg').innerHTML = '<span class="ng">' + esc(e.message) + '</span>'; }
     render();
   }
   async function addInvoices(files) {
-    for (var i = 0; i < files.length; i++) {
-      var f = files[i];
+    var list = Array.prototype.slice.call(files);
+    for (var i = 0; i < list.length; i++) {
+      var f = list[i];
       if (!/\.(xlsx|xls)$/i.test(f.name)) continue;
       if (invoices.some(function (x) { return x.file === f.name; })) continue;
       try { invoices.push(parseInvoice(f, await readWorkbook(f))); } catch (e) { $('msg').innerHTML = '<span class="ng">' + esc(e.message) + '</span>'; }
