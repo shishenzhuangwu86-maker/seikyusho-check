@@ -400,14 +400,14 @@
     var noName = invoices.filter(function (iv) { return iv.noNames; });
     var nnPeople = noName.reduce(function (a, iv) { return a + (iv.summary.people || 0); }, 0), nnAmt = noName.reduce(function (a, iv) { return a + (iv.summary.amount || 0); }, 0);
     var sumP = P.reduce(function (a, x) { return a + (x.amount || 0); }, 0) + nnAmt;
-    var nUniqueP = Object.keys(seen).length + nnPeople;
+    var nUniqueNamed = Object.keys(seen).length, nUniqueP = nUniqueNamed + nnPeople;
     var okAll = missing.length === 0 && extra.length === 0 && amtDiff.length === 0 && dups.length === 0 && Math.abs(sumR - sumP) <= 20;
 
     var h = '';
     h += '<h2 style="margin-top:0">チェック結果 <span class="badge ' + (okAll ? 'ok' : 'ng') + '">' + (okAll ? '問題なし' : '要確認あり') + '</span></h2>';
     h += '<div class="totals">' +
       '<div class="tot"><div class="k">名簿</div><div class="v">' + R.length + '人</div><div class="s">' + yen(sumR) + '</div></div>' +
-      '<div class="tot"><div class="k">請求書</div><div class="v">' + nUniqueP + '人' + (nUniqueP !== P.length ? ' <span class="ng">(重複込み ' + P.length + ')</span>' : '') + '</div><div class="s">' + yen(sumP) + '</div></div>' +
+      '<div class="tot"><div class="k">請求書</div><div class="v">' + nUniqueP + '人' + (nUniqueNamed !== P.length ? ' <span class="ng">(重複込み ' + (P.length + nnPeople) + ')</span>' : '') + (nnPeople ? ' <span class="small">(名前なし' + nnPeople + '件含む)</span>' : '') + '</div><div class="s">' + yen(sumP) + '</div></div>' +
       Object.keys(byKind).map(function (k) { return '<div class="tot"><div class="k">' + k + '</div><div class="v">' + byKind[k].people + '人</div><div class="s">' + byKind[k].files + 'ファイル / ' + yen(byKind[k].amount) + '</div></div>'; }).join('') +
       '<div class="tot ' + (R.length === nUniqueP && Math.abs(sumR - sumP) <= 20 ? 'ok' : 'ng') + '"><div class="k">差(請求書 − 名簿)</div><div class="v">' + (nUniqueP - R.length > 0 ? '+' : '') + (nUniqueP - R.length) + '人</div><div class="s">' + (sumP - sumR >= 0 ? '+' : '−') + yen(Math.abs(sumP - sumR)).slice(1) + '円</div></div>' +
       '</div>';
