@@ -50,7 +50,7 @@
 <body>
 <div class="wrap">
   <h1>請求書 名簿チェック</h1>
-  <p class="sub">カイポケの「お客様負担金額集計一覧」と、送る請求書Excel（国保・社保）を突き合わせて、漏れ・重複・金額の違いを確認します。ファイルはこのブラウザの中だけで読み取り、どこにも送信しません。</p>
+  <p class="sub">カイポケの「お客様負担金額集計一覧」と、請求書（Excel または PDF、国保・社保）を突き合わせて、漏れ・重複・金額の違いを確認します。ファイルはこのブラウザの中だけで読み取り、どこにも送信しません。</p>
 
   <div class="grid noprint">
     <div class="card">
@@ -59,8 +59,8 @@
       <ul class="files" id="listR"></ul>
     </div>
     <div class="card">
-      <label class="drop" id="dropI" for="fileI"><strong>② 請求書Excel（国保・社保）</strong><span>.xls / .xlsx を何件でも。送信画面に入れるのと同じファイル</span></label>
-      <input type="file" id="fileI" multiple accept=".xls,.xlsx">
+      <label class="drop" id="dropI" for="fileI"><strong>② 請求書（国保・社保）Excel または PDF</strong><span>.xls / .xlsx / .pdf を何件でも。PDFは明細書のページから名前と請求額を読みます</span></label>
+      <input type="file" id="fileI" multiple accept=".xls,.xlsx,.pdf">
       <ul class="files" id="listI"></ul>
     </div>
   </div>
@@ -74,11 +74,14 @@
 </div>
 
 <script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js"></script>
 <script>
 (function () {
   var $ = function (id) { return document.getElementById(id); };
   var roster = null, invoices = [];
   var XLSX = (typeof window !== 'undefined' && window.XLSX) || (typeof require === 'function' ? require('xlsx') : null);
+  var PDFJS = (typeof window !== 'undefined' && window.pdfjsLib) || (typeof require === 'function' ? require('pdfjs-dist/legacy/build/pdf.js') : null);
+  if (PDFJS && typeof window !== 'undefined') PDFJS.GlobalWorkerOptions.workerSrc = 'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js';
 
   // ---------- 名前の正規化 ----------
   var VAR = { '髙':'高', '﨑':'崎', '嵜':'崎', '齋':'斎', '齊':'斉', '邊':'辺', '邉':'辺', '國':'国', '澤':'沢', '濱':'浜', '廣':'広', '櫻':'桜', '藝':'芸', '栁':'柳', '瀨':'瀬', '槇':'槙', '眞':'真', '黑':'黒', '德':'徳', '惠':'恵', '彌':'弥', '壽':'寿', '條':'条', '萬':'万', '與':'与', '曾':'曽', '舘':'館' };
@@ -182,6 +185,118 @@
     return { file: file.name, kind: kind, summary: summary, persons: persons };
   }
 
+  // ---------- PDF(請求書・明細書) ----------
+  function readArrayBuffer(file) {
+    return new Promise(function (res, rej) { var r = new FileReader(); r.onload = function () { res(r.result); }; r.onerror = function () { rej(new Error(file.name + ' を読めませんでした')); }; r.readAsArrayBuffer(file); });
+  }
+  // ページ内の文字(位置つき)を、上から順の行 → 左から順のセル に組み立てる。文字間の小さな隙間は同じセルとして連結
+  function pdfPageRows(items) {
+    var its = items.filter(function (i) { return String(i.str).trim() !== ''; }).map(function (i) { return { s: i.str, x: i.x, y: i.y, w: i.w || 0, h: i.h || 10 }; });
+    its.sort(function (a, b) { return (b.y - a.y) || (a.x - b.x); });
+    var lines = [];
+    its.forEach(function (it) {
+      var ln = lines.length ? lines[lines.length - 1] : null;
+      if (ln && Math.abs(ln.y - it.y) <= Math.max(2, it.h * 0.4)) ln.items.push(it); else lines.push({ y: it.y, items: [it] });
+    });
+    lines.forEach(function (ln) {
+      ln.items.sort(function (a, b) { return a.x - b.x; });
+      var cells = [];
+      ln.items.forEach(function (it) {
+        var last = cells.length ? cells[cells.length - 1] : null;
+        if (last && it.x - (last.x + last.w) < Math.max(4, it.h * 1.6)) { last.s += (it.x - (last.x + last.w) > it.h * 0.5 ? '　' : '') + it.s; last.w = (it.x + it.w) - last.x; }
+        else cells.push({ s: it.s, x: it.x, w: it.w, h: it.h });
+      });
+      ln.cells = cells;
+    });
+    return lines;
+  }
+  // 明細書ページ(1人分): 氏名 と 請求額(「請求」列の 保険 行、無ければ 公①〜④ の行)
+  function meisaiFromLines(lines) {
+    var name = null, amount = null, how = '';
+    for (var i = 0; i < lines.length && !name; i++) {
+      var cells = lines[i].cells;
+      for (var j = 0; j < cells.length; j++) {
+        if (norm(cells[j].s) !== '氏名') continue;
+        var right = cells.slice(j + 1).map(function (c) { return c.s.trim(); }).filter(Boolean)[0] || null;
+        var below = null;
+        for (var k = i + 1; k < Math.min(lines.length, i + 3) && !below; k++) {
+          var cs = lines[k].cells.filter(function (c) { return c.x >= cells[j].x - 2 && c.x < cells[j].x + 220 && c.s.trim(); });
+          var joined = '', endX = null;
+          cs.forEach(function (c) { if (endX != null && c.x - endX > c.h * 2.5) return; joined += (joined ? '　' : '') + c.s.trim(); endX = c.x + c.w; });
+          if (joined && !/^[\d\s　,円]+$/.test(joined)) below = joined;
+        }
+        name = (below && /[一-鿿぀-ゟ]/.test(below)) ? below : (right || below);
+        break;
+      }
+    }
+    var col = null, hdrIdx = -1;
+    for (i = 0; i < lines.length && col == null; i++) {
+      lines[i].cells.forEach(function (c) { if (col == null && norm(c.s) === '請求') { col = c.x + c.w / 2; hdrIdx = i; } });
+    }
+    if (col != null) {
+      var pub = null;
+      for (i = hdrIdx + 1; i < Math.min(lines.length, hdrIdx + 14); i++) {
+        var lc = lines[i].cells, first = norm(lc[0] ? lc[0].s : '');
+        var cell = lc.filter(function (c) { return Math.abs((c.x + c.w / 2) - col) < 60 && num(c.s) != null; })[0];
+        if (!cell) continue;
+        if (/^保険/.test(first)) { amount = num(cell.s); how = '保険'; break; }
+        if (/^公/.test(first) && pub == null) pub = { amount: num(cell.s), how: first };
+      }
+      if (amount == null && pub) { amount = pub.amount; how = pub.how; }
+    }
+    if (!name) return null;
+    return { name: name, amount: amount, how: how || '額なし' };
+  }
+  // 請求書ページ: 「件数 … 金額」見出し行のセル位置を列の基準にして、各行を [ラベル, 列1, 列2, ...] の形に揃える
+  function rowsByHeader(lines) {
+    var cols = null, out = [];
+    lines.forEach(function (l) {
+      var cs = l.cells, isHdr = cs.some(function (c) { return norm(c.s) === '件数'; }) && cs.some(function (c) { return norm(c.s) === '金額'; });
+      if (isHdr) {
+        var first = cs.filter(function (c) { return norm(c.s) === '件数'; })[0];
+        cols = cs.filter(function (c) { return c.x + c.w / 2 >= first.x - 5; }).map(function (c) { return c.x + c.w / 2; });
+        out.push([''].concat(cs.filter(function (c) { return c.x + c.w / 2 >= first.x - 5; }).map(function (c) { return c.s; })));
+        return;
+      }
+      if (!cols) { out.push([cs.map(function (c) { return c.s; }).join('|')]); return; }
+      var row = [''];
+      for (var i = 0; i < cols.length; i++) row.push('');
+      cs.forEach(function (c) {
+        var cx = c.x + c.w / 2;
+        if (cx < cols[0] - 45 || (cx < cols[0] && num(c.s) == null)) { row[0] = row[0] ? row[0] + '|' + c.s : c.s; return; } // 件数列より左の文字はラベル扱い
+        var best = 0;
+        for (var i = 1; i < cols.length; i++) if (Math.abs(cols[i] - cx) < Math.abs(cols[best] - cx)) best = i;
+        if (Math.abs(cols[best] - cx) <= 45) row[best + 1] = row[best + 1] ? row[best + 1] + ' ' + c.s : c.s; else row.push(c.s);
+      });
+      out.push(row);
+    });
+    return out;
+  }
+  async function parseInvoicePdf(file, data) {
+    var doc = await PDFJS.getDocument({ data: data }).promise;
+    var kind = /社保|社会保険/.test(file.name) ? '社保' : null;
+    var persons = [], formRows = [], pages = { meisai: 0, seikyu: 0, other: 0 };
+    for (var p = 1; p <= doc.numPages; p++) {
+      var page = await doc.getPage(p), tc = await page.getTextContent();
+      var lines = pdfPageRows(tc.items.map(function (i) { return { str: i.str, x: i.transform[4], y: i.transform[5], w: i.width, h: i.height }; }));
+      var ntext = norm(lines.map(function (l) { return l.cells.map(function (c) { return c.s; }).join('|'); }).join('\n'));
+      if (/明細書/.test(ntext) && /氏名/.test(ntext)) {
+        pages.meisai++;
+        var pr = meisaiFromLines(lines);
+        if (pr) persons.push({ name: pr.name, key: normName(pr.name), parts: splitName(pr.name), amount: pr.amount, how: pr.how, file: file.name + ' (p.' + p + ')', kind: null });
+      } else if (/請求書/.test(ntext)) {
+        pages.seikyu++;
+        formRows.push.apply(formRows, rowsByHeader(lines));
+        if (!kind && /医保|様式第一|社会保険|医療保険/.test(ntext)) kind = '社保';
+        if (!kind && /国民健康保険|後期高齢者医療/.test(ntext)) kind = '国保';
+      } else pages.other++;
+    }
+    kind = kind || '国保';
+    persons.forEach(function (q) { q.kind = kind; });
+    var summary = formRows.length ? extractSummary(formRows) : { found: false, people: 0, amount: 0 };
+    return { file: file.name, kind: kind, summary: summary, persons: persons, pdf: pages, noNames: persons.length === 0 };
+  }
+
   // ---------- 突き合わせ(純粋関数: 名簿 R と 請求書の人 P) ----------
   function reconcile(R, P) {
     // 請求書側の重複(同じ名前が2回)
@@ -225,13 +340,17 @@
     var amtUnknown = rowsOut.filter(function (o) { return o.p && o.p.amount == null; });
     return { rowsOut: rowsOut, fuzzy: fuzzy, missing: missing, extra: extra, dups: dups, amtDiff: amtDiff, amtUnknown: amtUnknown, seen: seen };
   }
-  if (typeof module !== 'undefined') module.exports = { normName: normName, splitName: splitName, lev: lev, parseRoster: parseRoster, extractSummary: extractSummary, personAmount: personAmount, parseInvoice: parseInvoice, reconcile: reconcile };
+  if (typeof module !== 'undefined') module.exports = { normName: normName, splitName: splitName, lev: lev, parseRoster: parseRoster, extractSummary: extractSummary, personAmount: personAmount, parseInvoice: parseInvoice, reconcile: reconcile, pdfPageRows: pdfPageRows, meisaiFromLines: meisaiFromLines, parseInvoicePdf: parseInvoicePdf };
   if (typeof document === 'undefined') return;
 
   // ---------- 画面 ----------
   function render() {
     $('listR').innerHTML = roster ? '<li><span>' + esc(roster.file.name) + '</span><span class="d">' + roster.rows.length + '人 / ' + yen(roster.rows.reduce(function (a, x) { return a + (x.amount || 0); }, 0)) + '</span></li>' : '';
-    $('listI').innerHTML = invoices.map(function (iv, i) { return '<li><span>' + esc(iv.file) + '</span><span class="d">' + iv.kind + ' ' + iv.persons.length + '人 / ' + yen(iv.persons.reduce(function (a, x) { return a + (x.amount || 0); }, 0)) + ' <a href="#" data-i="' + i + '" class="rm">×</a></span></li>'; }).join('');
+    $('listI').innerHTML = invoices.map(function (iv, i) {
+      var d = iv.pdf ? (iv.noNames ? '<span class="warn">PDF 名前なし(請求書' + iv.pdf.seikyu + 'p) ' + iv.summary.people + '件 / ' + yen(iv.summary.amount) + '</span>' : 'PDF 明細書' + iv.pdf.meisai + 'p ' + iv.persons.length + '人 / ' + yen(iv.persons.reduce(function (a, x) { return a + (x.amount || 0); }, 0)))
+                     : iv.persons.length + '人 / ' + yen(iv.persons.reduce(function (a, x) { return a + (x.amount || 0); }, 0));
+      return '<li><span>' + esc(iv.file) + '</span><span class="d">' + iv.kind + ' ' + d + ' <a href="#" data-i="' + i + '" class="rm">×</a></span></li>';
+    }).join('');
     $('run').disabled = !(roster && invoices.length);
   }
   $('listI').addEventListener('click', function (e) { var a = e.target.closest('a.rm'); if (!a) return; e.preventDefault(); invoices.splice(+a.dataset.i, 1); render(); });
@@ -247,9 +366,12 @@
     var list = Array.prototype.slice.call(files);
     for (var i = 0; i < list.length; i++) {
       var f = list[i];
-      if (!/\.(xlsx|xls)$/i.test(f.name)) continue;
+      if (!/\.(xlsx|xls|pdf)$/i.test(f.name)) continue;
       if (invoices.some(function (x) { return x.file === f.name; })) continue;
-      try { invoices.push(parseInvoice(f, await readWorkbook(f))); } catch (e) { $('msg').innerHTML = '<span class="ng">' + esc(e.message) + '</span>'; }
+      try {
+        if (/\.pdf$/i.test(f.name)) { if (!PDFJS) throw new Error('PDF読み取り用の部品を読み込めませんでした(ネット接続を確認してください)'); $('msg').textContent = f.name + ' を読み取り中…'; invoices.push(await parseInvoicePdf(f, new Uint8Array(await readArrayBuffer(f)))); $('msg').textContent = ''; }
+        else invoices.push(parseInvoice(f, await readWorkbook(f)));
+      } catch (e) { $('msg').innerHTML = '<span class="ng">' + esc(e.message) + '</span>'; }
     }
     invoices.sort(function (a, b) { return a.kind === b.kind ? a.file.localeCompare(b.file, 'ja') : (a.kind === '国保' ? -1 : 1); });
     render();
@@ -275,8 +397,10 @@
       var k = byKind[iv.kind] = byKind[iv.kind] || { files: 0, people: 0, amount: 0, formAmount: 0 };
       k.files++; k.people += iv.persons.length; k.amount += iv.persons.reduce(function (a, x) { return a + (x.amount || 0); }, 0); k.formAmount += iv.summary.amount;
     });
-    var sumP = P.reduce(function (a, x) { return a + (x.amount || 0); }, 0);
-    var nUniqueP = Object.keys(seen).length;
+    var noName = invoices.filter(function (iv) { return iv.noNames; });
+    var nnPeople = noName.reduce(function (a, iv) { return a + (iv.summary.people || 0); }, 0), nnAmt = noName.reduce(function (a, iv) { return a + (iv.summary.amount || 0); }, 0);
+    var sumP = P.reduce(function (a, x) { return a + (x.amount || 0); }, 0) + nnAmt;
+    var nUniqueP = Object.keys(seen).length + nnPeople;
     var okAll = missing.length === 0 && extra.length === 0 && amtDiff.length === 0 && dups.length === 0 && Math.abs(sumR - sumP) <= 20;
 
     var h = '';
@@ -290,6 +414,11 @@
 
     function tbl(head, rows) { return rows.length ? '<table><tr>' + head.map(function (x) { return '<th' + (/^¥|金額|No/.test(x) ? ' class="n"' : '') + '>' + x + '</th>'; }).join('') + '</tr>' + rows.join('') + '</table>' : '<p class="small">なし</p>'; }
 
+    if (noName.length) {
+      h += '<h2>名前の入っていないPDF（金額だけ確認） <span class="badge warn">' + noName.length + 'ファイル</span></h2>' +
+           '<p class="small">このPDFには請求書のページしか無く、利用者の名前が載っていないため、名簿との名前の突き合わせはできません。件数と金額だけ合計に含めています。名前まで確認するには、明細書のページが入ったPDFかExcelを入れてください。</p>' +
+           tbl(['ファイル', '区分', '件数', '金額'], noName.map(function (iv) { return '<tr class="warn"><td class="small">' + esc(iv.file) + '</td><td>' + iv.kind + '</td><td class="n">' + iv.summary.people + '</td><td class="n">' + yen(iv.summary.amount) + '</td></tr>'; }));
+    }
     h += '<h2>名簿にいるが請求書がない人 <span class="badge ' + (missing.length ? 'ng' : 'ok') + '">' + missing.length + '人</span></h2>';
     h += tbl(['No', '名簿の名前', '名簿の金額'], missing.map(function (r) { return '<tr class="ng"><td class="n">' + esc(r.no) + '</td><td>' + esc(r.name) + '</td><td class="n">' + yen(r.amount) + '</td></tr>'; }));
 
